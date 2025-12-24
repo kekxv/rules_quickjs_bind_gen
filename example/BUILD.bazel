@@ -1,0 +1,29 @@
+load("//rules:defs.bzl", "qjs_cc_library")
+
+# 2. 定义实际的 C++ 库
+cc_library(
+    name = "my_api_lib",
+    srcs = ["my_api.cpp"],
+    hdrs = ["my_api.h"],
+    includes = ["."],
+)
+
+# 3. 生成绑定库
+qjs_cc_library(
+    name = "my_api_js_bind",
+    header = "my_api.h",
+    module_name = "my_api",
+    deps = [":my_api_lib"],
+)
+
+cc_binary(
+    name = "demo",
+    srcs = [
+        "demo.cc",
+    ],
+    includes = ["."],
+    deps = [
+        ":my_api_js_bind",
+        "@quickjs-ng",
+    ],
+)

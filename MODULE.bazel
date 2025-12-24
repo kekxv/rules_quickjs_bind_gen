@@ -1,0 +1,12 @@
+module(
+    name = "rules_quickjs_bin_gen",
+    version = "0.1.0",
+    bazel_compatibility = [">=7.2.1"],
+)
+
+bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "bazel_skylib", version = "1.8.2")
+bazel_dep(name = "rules_cc", version = "0.2.14")
+bazel_dep(name = "boost.filesystem", version = "1.89.0.bcr.2")
+bazel_dep(name = "boost.algorithm", version = "1.89.0.bcr.2")
+bazel_dep(name = "quickjs-ng", version = "0.11.0")
