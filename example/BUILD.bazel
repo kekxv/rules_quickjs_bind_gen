@@ -12,6 +12,7 @@ cc_library(
 qjs_cc_library(
     name = "my_api_js_bind",
     header = "my_api.h",
+    include_list = ["my_api.h"],
     module_name = "my_api",
     deps = [":my_api_lib"],
 )
