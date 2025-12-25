@@ -1,5 +1,5 @@
 module(
-    name = "rules_quickjs_bin_gen",
+    name = "rules_quickjs_bind_gen",
     version = "0.1.0",
     bazel_compatibility = [">=7.2.1"],
 )

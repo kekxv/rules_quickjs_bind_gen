@@ -3,20 +3,32 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <sstream>
 #include <boost/filesystem.hpp>
 #include <boost/regex.hpp>
+#include <boost/algorithm/string.hpp>
 
 namespace fs = boost::filesystem;
+
+// 宏保护状态结构
+struct GuardState
+{
+  std::string line; // 完整的 #if/ifdef 行
+  std::string symbol; //如果是 #ifndef X，这里存储 X，用于检测 Header Guard
+  bool isHeaderGuard; // 标记是否为头文件保护符
+};
 
 struct FuncDef
 {
   std::string retType, name, args;
+  std::vector<std::string> guards;
 };
 
 struct EnumDef
 {
   std::string name;
   std::vector<std::pair<std::string, int>> members;
+  std::vector<std::string> guards;
 };
 
 struct MacroDef
@@ -29,14 +41,15 @@ class BindingGenerator
   std::string inputPath;
   std::string outputDir;
   std::string moduleName;
+  std::vector<std::string> extraIncludes;
 
   std::vector<FuncDef> functions;
   std::vector<EnumDef> enums;
   std::vector<MacroDef> macros;
 
 public:
-  BindingGenerator(std::string in, std::string out, std::string mod)
-    : inputPath(in), outputDir(out), moduleName(mod)
+  BindingGenerator(std::string in, std::string out, std::string mod, std::vector<std::string> extras)
+    : inputPath(in), outputDir(out), moduleName(mod), extraIncludes(extras)
   {
   }
 
@@ -44,16 +57,10 @@ public:
   {
     try
     {
-      // 移除块注释 /* ... */
       boost::regex re_block(R"(/\*[\s\S]*?\*/)");
       std::string temp = boost::regex_replace(source, re_block, "");
-
-      // 移除行注释 // ...
-      // 注意：使用 [^\r\n]* 避免吞噬换行符，防止多行代码被合并
       boost::regex re_line(R"(//[^\r\n]*)");
       std::string clean = boost::regex_replace(temp, re_line, "");
-
-      // 安全检查：如果清理后内容过少（可能是正则误删），回退到原始内容
       if (clean.length() < 10 && source.length() > 50) return source;
       return clean;
     }
@@ -81,6 +88,20 @@ public:
     return boost::regex_replace(raw, re_space, " ");
   }
 
+  // 辅助函数：提取当前的有效 Guards（过滤掉 Header Guard）
+  std::vector<std::string> get_active_guards(const std::vector<GuardState>& stack)
+  {
+    std::vector<std::string> active;
+    for (const auto& g : stack)
+    {
+      if (!g.isHeaderGuard)
+      {
+        active.push_back(g.line);
+      }
+    }
+    return active;
+  }
+
   void parse()
   {
     std::ifstream file(inputPath);
@@ -89,83 +110,165 @@ public:
       std::cerr << "Error: Cannot open file " << inputPath << std::endl;
       exit(1);
     }
-    std::string raw_content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
-    // 1. Macros (宏定义)
-    boost::regex re_macro(R"(^\s*#define\s+([A-Z0-9_]+)\s+(\".*\"|-?\d+(\.\d+)?))");
-    for (boost::sregex_iterator i = boost::sregex_iterator(raw_content.begin(), raw_content.end(), re_macro);
-         i != boost::sregex_iterator(); ++i)
-    {
-      macros.push_back({(*i)[1], (*i)[2]});
-    }
+    std::string line;
+    std::vector<GuardState> guardStack;
+    std::string buffer;
 
-    // 移除注释，净化代码用于后续解析
-    std::string content = remove_comments(raw_content);
-
-    // 2. Enums (枚举)
-    boost::regex re_enum(R"(enum\s+(class\s+)?(\w+)\s*\{([^}]*)\};)");
-    for (boost::sregex_iterator i = boost::sregex_iterator(content.begin(), content.end(), re_enum);
-         i != boost::sregex_iterator(); ++i)
-    {
-      boost::smatch m = *i;
-      EnumDef edef;
-      edef.name = m[2];
-      std::string body = m[3];
-
-      boost::regex re_member(R"((\w+)(\s*=\s*(-?\d+))?)");
-      int currentVal = 0;
-      auto start = body.cbegin();
-      while (boost::regex_search(start, body.cend(), m, re_member))
-      {
-        if (m[1].length() > 0)
-        {
-          if (m[3].matched) currentVal = std::stoi(m[3]);
-          edef.members.push_back({m[1], currentVal++});
-        }
-        start = m.suffix().first;
-      }
-      enums.push_back(edef);
-    }
-
-    // 3. Functions (函数)
-    // 匹配模式：返回类型 函数名(参数) { 或 ;
+    // 正则定义
+    boost::regex re_macro_val(R"(^\s*#define\s+([A-Z0-9_]+)\s+(\".*\"|-?\d+(\.\d+)?))");
+    boost::regex re_ifndef(R"(^\s*#ifndef\s+([A-Z0-9_]+))");
+    boost::regex re_define_simple(R"(^\s*#define\s+([A-Z0-9_]+))");
+    boost::regex re_enum_cpp(R"(enum\s+(class\s+)?(\w+)\s*\{([^}]*)\};)");
+    boost::regex re_enum_c(R"(typedef\s+enum\s*\{([^}]*)\}\s*(\w+);)");
     boost::regex re_func(R"(([a-zA-Z0-9_:<>\*&\s]+?)\s+(\w+)\s*\(([\s\S]*?)\)\s*(?:;|{))");
+    boost::regex re_enum_member(R"((\w+)(\s*=\s*(-?\d+))?)");
 
-    // 黑名单：防止将控制流关键字误判为函数
     std::set<std::string> blacklist = {
-      "if", "while", "for", "switch", "return", "sizeof", "catch",
-      "using", "typedef", "template", "struct", "class", "operator", "else"
+      "if", "while", "for", "switch", "return", "sizeof", "catch", "else",
+      "using", "template", "operator", "void"
     };
 
-    auto start = content.cbegin();
-    auto end = content.cend();
-    boost::smatch match;
+    bool in_comment_block = false;
 
-    while (boost::regex_search(start, end, match, re_func))
+    while (std::getline(file, line))
     {
-      std::string rawRetType = match[1];
-      std::string funcName = match[2];
-      std::string rawArgs = match[3];
+      std::string trimmed = line;
+      boost::trim(trimmed);
 
-      if (blacklist.count(funcName))
+      if (in_comment_block)
       {
-        start = match.suffix().first;
+        if (trimmed.find("*/") != std::string::npos) in_comment_block = false;
+        continue;
+      }
+      if (trimmed.find("/*") != std::string::npos)
+      {
+        if (trimmed.find("*/") == std::string::npos) in_comment_block = true;
+        trimmed = trimmed.substr(0, trimmed.find("/*"));
+      }
+      if (trimmed.find("//") != std::string::npos)
+      {
+        trimmed = trimmed.substr(0, trimmed.find("//"));
+        boost::trim(trimmed);
+      }
+      if (trimmed.empty()) continue;
+
+      if (trimmed[0] == '#')
+      {
+        boost::smatch m;
+        if (boost::starts_with(trimmed, "#define"))
+        {
+          if (boost::regex_search(trimmed, m, re_define_simple))
+          {
+            std::string defSym = m[1];
+            if (!guardStack.empty())
+            {
+              if (guardStack.back().symbol == defSym)
+              {
+                guardStack.back().isHeaderGuard = true;
+                continue;
+              }
+            }
+          }
+          if (boost::regex_search(trimmed, m, re_macro_val))
+          {
+            macros.push_back({m[1], m[2]});
+          }
+        }
+        else if (boost::starts_with(trimmed, "#if"))
+        {
+          GuardState gs;
+          gs.line = trimmed;
+          gs.isHeaderGuard = false;
+          if (boost::starts_with(trimmed, "#ifndef") && boost::regex_search(trimmed, m, re_ifndef))
+          {
+            gs.symbol = m[1];
+          }
+          guardStack.push_back(gs);
+        }
+        else if (boost::starts_with(trimmed, "#endif"))
+        {
+          if (!guardStack.empty()) guardStack.pop_back();
+        }
+        else if (boost::starts_with(trimmed, "#else") || boost::starts_with(trimmed, "#elif"))
+        {
+          if (!guardStack.empty()) guardStack.pop_back();
+          guardStack.push_back({trimmed, "", false});
+        }
         continue;
       }
 
-      std::string cleanRet = clean_type_string(rawRetType);
-      // 过滤无效解析（如空类型或宏行）
-      if (cleanRet.empty() || cleanRet.find('#') != std::string::npos)
+      buffer += trimmed + " ";
+
+      if (trimmed.back() == ';' || trimmed.back() == '}' || trimmed.back() == '{')
       {
-        start = match.suffix().first;
-        continue;
+        boost::smatch m;
+
+        if (buffer.find("typedef") != std::string::npos && buffer.find("enum") == std::string::npos)
+        {
+          buffer.clear();
+          continue;
+        }
+
+        if (boost::regex_search(buffer, m, re_enum_cpp))
+        {
+          process_enum(m[2], m[3], get_active_guards(guardStack), re_enum_member);
+          buffer.clear();
+          continue;
+        }
+        if (boost::regex_search(buffer, m, re_enum_c))
+        {
+          process_enum(m[2], m[1], get_active_guards(guardStack), re_enum_member);
+          buffer.clear();
+          continue;
+        }
+
+        if (boost::regex_search(buffer, m, re_func))
+        {
+          std::string rawRet = m[1];
+          std::string name = m[2];
+          std::string rawArgs = m[3];
+
+          // [新增] 过滤可变参数函数
+          if (rawArgs.find("...") != std::string::npos)
+          {
+            buffer.clear();
+            continue;
+          }
+
+          if (blacklist.count(name) == 0 && rawRet.find('#') == std::string::npos)
+          {
+            std::string cleanRet = clean_type_string(rawRet);
+            if (!cleanRet.empty())
+            {
+              functions.push_back({cleanRet, name, clean_args_string(rawArgs), get_active_guards(guardStack)});
+            }
+          }
+        }
+        buffer.clear();
       }
-
-      std::string cleanArgs = clean_args_string(rawArgs);
-      functions.push_back({cleanRet, funcName, cleanArgs});
-
-      start = match.suffix().first;
     }
+  }
+
+  void process_enum(std::string name, std::string body, const std::vector<std::string>& guards,
+                    const boost::regex& re_member)
+  {
+    EnumDef edef;
+    edef.name = name;
+    edef.guards = guards;
+    boost::smatch m;
+    int currentVal = 0;
+    auto start = body.cbegin();
+    while (boost::regex_search(start, body.cend(), m, re_member))
+    {
+      if (m[1].length() > 0)
+      {
+        if (m[3].matched) currentVal = std::stoi(m[3]);
+        edef.members.push_back({m[1], currentVal++});
+      }
+      start = m.suffix().first;
+    }
+    enums.push_back(edef);
   }
 
   void generate()
@@ -173,20 +276,36 @@ public:
     fs::path outCppPath = fs::path(outputDir) / (moduleName + "_bind.cpp");
     fs::path outHPath = fs::path(outputDir) / (moduleName + "_bind.h");
 
-    // --- 1. 生成 .cpp 文件 ---
     std::ofstream out(outCppPath.string());
 
     out << "// Generated by Project Gemini\n";
     out << "#include \"quickjs.h\"\n";
     out << "#include \"qjs_utils.hpp\"\n";
-    out << "#include \"" << fs::path(inputPath).filename().string() << "\"\n\n";
 
-    // 定义 JSCFunctionListEntry 数组
+    for (const auto& inc : extraIncludes)
+    {
+      if (inc.empty()) continue;
+      if (inc.find('<') == std::string::npos && inc.find('"') == std::string::npos)
+      {
+        out << "#include \"" << inc << "\"\n";
+      }
+      else
+      {
+        out << "#include " << inc << "\n";
+      }
+    }
+
+    // out << "#include \"" << fs::path(inputPath).filename().string() << "\"\n\n";
+
     out << "static const JSCFunctionListEntry js_" << moduleName << "_funcs[] = {\n";
+
     for (const auto& f : functions)
     {
+      for (const auto& g : f.guards) out << g << "\n";
       out << "    JS_CFUNC_DEF(\"" << f.name << "\", 0, (Wrapper<" << f.name << ">::call)),\n";
+      for (size_t i = 0; i < f.guards.size(); ++i) out << "#endif\n";
     }
+
     for (const auto& m : macros)
     {
       if (m.value.find('"') != std::string::npos)
@@ -200,18 +319,15 @@ public:
     }
     out << "};\n\n";
 
-    // 定义模块初始化函数
     out << "extern \"C\" JSModuleDef* js_init_module_" << moduleName << "(JSContext* ctx, const char* module_name) {\n";
     out << "    JSModuleDef* m = JS_NewCModule(ctx, module_name, [](JSContext* ctx, JSModuleDef* m) {\n";
-
-    // 在 Init 回调中设置导出值
     out << "        if (JS_SetModuleExportList(ctx, m, js_" << moduleName << "_funcs, \n";
     out << "                                   sizeof(js_" << moduleName <<
       "_funcs)/sizeof(JSCFunctionListEntry)) != 0) return -1;\n";
 
-    // 在 Init 回调中创建并导出枚举对象
     for (const auto& e : enums)
     {
+      for (const auto& g : e.guards) out << "    " << g << "\n";
       out << "        {\n";
       out << "            JSValue enum_obj = JS_NewObject(ctx);\n";
       for (const auto& mem : e.members)
@@ -221,54 +337,42 @@ public:
       }
       out << "            JS_SetModuleExport(ctx, m, \"" << e.name << "\", enum_obj);\n";
       out << "        }\n";
+      for (size_t i = 0; i < e.guards.size(); ++i) out << "    #endif\n";
     }
     out << "        return 0;\n";
     out << "    });\n\n";
-
     out << "    if (!m) return nullptr;\n\n";
-
-    // 声明模块导出列表 (供 import 使用)
     out << "    JS_AddModuleExportList(ctx, m, js_" << moduleName << "_funcs, sizeof(js_" << moduleName <<
       "_funcs)/sizeof(JSCFunctionListEntry));\n";
+
     for (const auto& e : enums)
     {
+      for (const auto& g : e.guards) out << "    " << g << "\n";
       out << "    JS_AddModuleExport(ctx, m, \"" << e.name << "\");\n";
+      for (size_t i = 0; i < e.guards.size(); ++i) out << "    #endif\n";
     }
     out << "    return m;\n";
     out << "}\n";
     out.close();
 
-    // --- 2. 生成 .h 文件 ---
     std::ofstream outH(outHPath.string());
-
-    outH << "// Generated by Project Gemini\n";
-    outH << "#pragma once\n";
-    outH << "#include \"quickjs.h\"\n\n";
-
-    outH << "#ifdef __cplusplus\n";
-    outH << "extern \"C\" {\n";
-    outH << "#endif\n\n";
-
-    // 导出初始化函数的声明
+    outH <<
+      "// Generated by Project Gemini\n#pragma once\n#include \"quickjs.h\"\n\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n";
     outH << "JSModuleDef* js_init_module_" << moduleName << "(JSContext* ctx, const char* module_name);\n\n";
-
-    outH << "#ifdef __cplusplus\n";
-    outH << "}\n";
-    outH << "#endif\n";
+    outH << "#ifdef __cplusplus\n}\n#endif\n";
     outH.close();
   }
 };
 
 int main(int argc, char** argv)
 {
-  if (argc < 4)
-  {
-    std::cerr << "Usage: gemini_gen <input_header> <output_dir> <module_name>" << std::endl;
-    return 1;
-  }
+  if (argc < 4) return 1;
+  std::vector<std::string> includes;
+  for (int i = 4; i < argc; ++i) includes.push_back(argv[i]);
+
   try
   {
-    BindingGenerator gen(argv[1], argv[2], argv[3]);
+    BindingGenerator gen(argv[1], argv[2], argv[3], includes);
     gen.parse();
     gen.generate();
   }
