@@ -7,7 +7,8 @@
 #define MAX_USERS 100
 
 // --- 2. 枚举 (保持不变) ---
-enum class SystemState {
+enum class SystemState
+{
   BOOTING = 0,
   READY,
   SHUTDOWN
@@ -25,7 +26,8 @@ multiply(int a,
 
 // --- 5. 关键测试：Inline 函数 (带函数体) ---
 // 生成器会识别到 '{' 并停止，自动忽略 inline 关键字
-inline int add(int a, int b) {
+inline int add(int a, int b)
+{
   return a + b;
 }
 
