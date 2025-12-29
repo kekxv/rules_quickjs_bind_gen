@@ -1,6 +1,8 @@
 def _qjs_binding_impl(ctx):
+    # 1. 声明输出文件：必须包含 .d.ts
     out_cpp = ctx.actions.declare_file(ctx.attr.module_name + "_bind.cpp")
     out_h = ctx.actions.declare_file(ctx.attr.module_name + "_bind.h")
+    out_ts = ctx.actions.declare_file(ctx.attr.module_name + ".d.ts")  # <--- 新增这行
 
     args = ctx.actions.args()
     args.add(ctx.file.header.path)
@@ -8,20 +10,22 @@ def _qjs_binding_impl(ctx):
     args.add(ctx.attr.module_name)
 
     # 遍历列表，添加所有 include 到参数中
-    # C++ main 函数会从 argv[4] 开始依次读取它们
     for inc in ctx.attr.include_list:
         args.add(inc)
 
     ctx.actions.run(
         inputs = [ctx.file.header],
-        outputs = [out_cpp, out_h],
+        # 2. 将 .d.ts 添加到 outputs 列表
+        outputs = [out_cpp, out_h, out_ts],  # <--- 修改这里
         executable = ctx.executable._generator,
         arguments = [args],
         mnemonic = "QJSBindingGen",
-        progress_message = "Generating QuickJS bindings for %s" % ctx.attr.module_name,
+        progress_message = "Generating QuickJS bindings (and types) for %s" % ctx.attr.module_name,
     )
 
-    return [DefaultInfo(files = depset([out_cpp, out_h]))]
+    # 3. 返回 DefaultInfo，这样 bazel build 才会真正生成它
+    # 注意：cc_library 通常会忽略 .d.ts 文件，所以放在这里是安全的
+    return [DefaultInfo(files = depset([out_cpp, out_h, out_ts]))]
 
 qjs_binding_gen = rule(
     implementation = _qjs_binding_impl,
@@ -40,12 +44,21 @@ qjs_binding_gen = rule(
 # 封装宏
 def qjs_cc_library(name, header, module_name, includes = [], include_list = [], deps = []):
     gen_name = name + "_gen"
+    ts_target_name = name + "_ts"  # 新增一个 target名字
 
     qjs_binding_gen(
         name = gen_name,
         header = header,
         module_name = module_name,
-        include_list = include_list,  # 传递列表
+        include_list = include_list,
+    )
+
+    # [新增] 创建一个 filegroup 专门用来方便你找到 .d.ts 文件
+    # output_group 是为了以后如果分离更彻底，目前直接用 gen_name 也可以
+    native.filegroup(
+        name = ts_target_name,
+        srcs = [":" + gen_name],
+        output_group = "files",  # 默认输出
     )
 
     native.cc_library(
