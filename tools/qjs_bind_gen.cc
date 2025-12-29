@@ -4,19 +4,19 @@
 #include <vector>
 #include <set>
 #include <sstream>
-#include <algorithm> // added for cleanup
+#include <map>
+#include <algorithm>
 #include <boost/filesystem.hpp>
 #include <boost/regex.hpp>
 #include <boost/algorithm/string.hpp>
 
 namespace fs = boost::filesystem;
 
-// 宏保护状态结构
 struct GuardState
 {
-  std::string line; // 完整的 #if/ifdef 行 (例如 "#if LV_USE_BIDI")
-  std::string symbol; // 如果是 #ifndef X，这里存储 X，用于检测 Header Guard
-  bool isHeaderGuard; // 标记是否为头文件保护符
+  std::string line;
+  std::string symbol;
+  bool isHeaderGuard;
 };
 
 struct FuncDef
@@ -35,6 +35,7 @@ struct EnumDef
 struct MacroDef
 {
   std::string name, value;
+  std::vector<std::string> guards; // [New] Added guards for macros
 };
 
 class BindingGenerator
@@ -52,6 +53,70 @@ public:
   BindingGenerator(std::string in, std::string out, std::string mod, std::vector<std::string> extras)
     : inputPath(in), outputDir(out), moduleName(mod), extraIncludes(extras)
   {
+  }
+
+  // 简单的表达式求值器 (支持 | 和 << 以及括号)
+  int evaluate_expression(std::string expr, const std::map<std::string, int>& symbolTable)
+  {
+    // 预处理：去掉空格
+    expr.erase(std::remove(expr.begin(), expr.end(), ' '), expr.end());
+
+    // 处理 |
+    if (expr.find('|') != std::string::npos)
+    {
+      std::vector<std::string> parts;
+      boost::split(parts, expr, boost::is_any_of("|"));
+      int result = 0;
+      for (const auto& part : parts)
+      {
+        result |= evaluate_expression(part, symbolTable);
+      }
+      return result;
+    }
+
+    // 处理 ()
+    if (expr.length() > 2 && expr.front() == '(' && expr.back() == ')')
+    {
+      return evaluate_expression(expr.substr(1, expr.length() - 2), symbolTable);
+    }
+
+    // 处理 <<
+    size_t shiftPos = expr.find("<<");
+    if (shiftPos != std::string::npos)
+    {
+      std::string left = expr.substr(0, shiftPos);
+      std::string right = expr.substr(shiftPos + 2);
+      return evaluate_expression(left, symbolTable) << evaluate_expression(right, symbolTable);
+    }
+
+    // 处理 +
+    size_t plusPos = expr.find("+");
+    if (plusPos != std::string::npos)
+    {
+      std::string left = expr.substr(0, plusPos);
+      std::string right = expr.substr(plusPos + 1);
+      return evaluate_expression(left, symbolTable) + evaluate_expression(right, symbolTable);
+    }
+
+    // 基础值
+    if (expr.find("0x") == 0 || expr.find("0X") == 0)
+    {
+      try { return std::stoul(expr, nullptr, 16); }
+      catch (...) { return 0; }
+    }
+    if (isdigit(expr[0]) || (expr.length() > 1 && expr[0] == '-'))
+    {
+      try { return std::stoi(expr); }
+      catch (...) { return 0; }
+    }
+
+    // 查表
+    if (symbolTable.count(expr))
+    {
+      return symbolTable.at(expr);
+    }
+
+    return 0;
   }
 
   std::string remove_comments(const std::string& source)
@@ -89,10 +154,8 @@ public:
     return boost::regex_replace(raw, re_space, " ");
   }
 
-  // [New] C++ 类型到 TypeScript 类型的简单映射
   std::string cpp_to_ts_type(std::string cppType)
   {
-    // 移除 const, volatile, & 等修饰符以便匹配
     std::string t = cppType;
     boost::replace_all(t, "const", "");
     boost::replace_all(t, "volatile", "");
@@ -102,21 +165,18 @@ public:
     if (t == "void") return "void";
     if (t == "bool") return "boolean";
 
-    // 字符串
     if (t.find("char*") != std::string::npos || t.find("char *") != std::string::npos ||
       t.find("std::string") != std::string::npos)
     {
       return "string";
     }
 
-    // 数字类型
     static const std::set<std::string> numTypes = {
       "int", "short", "long", "float", "double", "size_t",
       "uint8_t", "int8_t", "uint16_t", "int16_t",
       "uint32_t", "int32_t", "uint64_t", "int64_t", "unsigned int"
     };
 
-    // 检查是否包含数字关键字
     bool isNum = false;
     for (const auto& nt : numTypes)
     {
@@ -128,8 +188,6 @@ public:
     }
     if (isNum) return "number";
 
-    // 如果是指针，通常映射为 any 或者 number (作为句柄)，这里暂用 any 安全
-    // 如果是已知的枚举，可以映射为枚举名（这里做一个简单的查找优化）
     for (const auto& e : enums)
     {
       if (t.find(e.name) != std::string::npos) return e.name;
@@ -138,7 +196,6 @@ public:
     return "any";
   }
 
-  // [Fixed] 解析参数字符串并生成 TS 签名 (arg1: type, arg2: type)
   std::string format_ts_args(const std::string& rawArgs)
   {
     if (rawArgs.empty() || rawArgs == "void") return "";
@@ -157,31 +214,22 @@ public:
       if (argStr == "void") continue;
 
       std::string type, name;
-      bool isArray = false; // [Fix] 标记是否为数组
+      bool isArray = false;
 
-      // 匹配结尾的变量名，识别 name[] 这种写法
-      boost::regex re_arg_name(R"((\w+)(\[\])?$)");
+      // [Fixed] 正则提取：类型 vs 变量名
+      boost::regex re_extract(R"((.*?)(?:\s+|[*&]+)([\w]+)(\[\])?$)");
       boost::smatch m;
 
-      if (boost::regex_search(argStr, m, re_arg_name))
+      if (boost::regex_match(argStr, m, re_extract))
       {
-        std::string possibleName = m[1]; // 纯名字，不带 []
-        if (m[2].matched) isArray = true; // [Fix] 捕获到了 []
+        type = m[1].str();
+        name = m[2].str();
+        if (m[3].matched) isArray = true;
 
-        std::string rest = m.prefix();
-        boost::trim(rest);
-
-        if (rest.empty() || rest == "const" || rest == "unsigned")
+        size_t namePos = argStr.rfind(name);
+        if (namePos != std::string::npos)
         {
-          // 只有类型的情况，比如 "int[]" 或 "int"
-          type = argStr;
-          name = "arg" + std::to_string(argCount++);
-        }
-        else
-        {
-          name = possibleName;
-          type = rest;
-          argCount++;
+          type = argStr.substr(0, namePos);
         }
       }
       else
@@ -190,12 +238,20 @@ public:
         name = "arg" + std::to_string(argCount++);
       }
 
-      // [Fix] 生成 TS 类型
-      std::string tsType = cpp_to_ts_type(type);
-      if (isArray)
+      boost::trim(type);
+      boost::trim(name);
+
+      if (name == "const" || name == "unsigned" || name == "struct" || name == "enum")
       {
-        tsType += "[]";
+        type = argStr;
+        name = "arg" + std::to_string(argCount++);
       }
+
+      boost::replace_all(name, "const", "");
+      boost::trim(name);
+
+      std::string tsType = cpp_to_ts_type(type);
+      if (isArray) tsType += "[]";
 
       if (i > 0) ss << ", ";
       ss << name << ": " << tsType;
@@ -220,15 +276,11 @@ public:
   {
     boost::regex re_ifdef(R"(^\s*#ifdef\s+(.*))");
     boost::smatch m;
-    if (boost::regex_match(line, m, re_ifdef))
-    {
-      return "#ifndef " + m[1].str();
-    }
+    if (boost::regex_match(line, m, re_ifdef)) return "#ifndef " + m[1].str();
+
     boost::regex re_ifndef(R"(^\s*#ifndef\s+(.*))");
-    if (boost::regex_match(line, m, re_ifndef))
-    {
-      return "#ifdef " + m[1].str();
-    }
+    if (boost::regex_match(line, m, re_ifndef)) return "#ifdef " + m[1].str();
+
     boost::regex re_if(R"(^\s*#if\s+(.*))");
     if (boost::regex_match(line, m, re_if))
     {
@@ -256,10 +308,12 @@ public:
     boost::regex re_ifndef(R"(^\s*#ifndef\s+([A-Z0-9_]+))");
     boost::regex re_define_simple(R"(^\s*#define\s+([A-Z0-9_]+))");
     boost::regex re_elif(R"(^\s*#elif\s+(.*))");
+
     boost::regex re_enum_cpp(R"(enum\s+(class\s+)?(\w+)\s*\{([^}]*)\};)");
     boost::regex re_enum_c(R"(typedef\s+enum\s*\{([^}]*)\}\s*(\w+);)");
+
     boost::regex re_func(R"(([a-zA-Z0-9_:<>\*&\s]+?)\s+(\w+)\s*\(([\s\S]*?)\)\s*(?:;|{))");
-    boost::regex re_enum_member(R"((\w+)(\s*=\s*(-?\d+))?)");
+    boost::regex re_enum_member(R"((\w+)(\s*=\s*([a-zA-Z0-9_]+|-?\d+|0x[0-9a-fA-F]+))?)"); // 这只是初始正则，process_enum 里有更强的
 
     std::set<std::string> blacklist = {
       "if", "while", "for", "switch", "return", "sizeof", "catch", "else",
@@ -309,7 +363,8 @@ public:
           }
           if (boost::regex_search(trimmed, m, re_macro_val))
           {
-            macros.push_back({m[1], m[2]});
+            // [Fixed] Save active guards
+            macros.push_back({m[1], m[2], get_active_guards(guardStack)});
           }
         }
         else if (boost::starts_with(trimmed, "#if"))
@@ -393,6 +448,11 @@ public:
             buffer.clear();
             continue;
           }
+          if (rawRet.find("d2_") != std::string::npos || rawArgs.find("d2_") != std::string::npos)
+          {
+            buffer.clear();
+            continue;
+          }
 
           if (blacklist.count(name) == 0 && rawRet.find('#') == std::string::npos)
           {
@@ -417,17 +477,17 @@ public:
   void process_enum(std::string name, std::string body, const std::vector<std::string>& guards,
                     const boost::regex& /*ignored*/)
   {
+    boost::regex re_complex_macro(R"(\b[A-Z_][A-Z0-9_]*\s*\()");
+    if (boost::regex_search(body, re_complex_macro)) return;
+
     EnumDef edef;
     edef.name = name;
     edef.guards = guards;
 
-    // 符号表：记录当前枚举已解析成员的值
     std::map<std::string, int> symbol_table;
 
-    // 升级版正则：支持 十进制、十六进制、别名 (标识符)
-    // Group 1: Key
-    // Group 2: Value String (可能是 123, -1, 0xFF, 或 ANOTHER_KEY)
-    boost::regex re_member(R"(([a-zA-Z0-9_]+)\s*(?:=\s*([a-zA-Z0-9_]+|-?\d+|0x[0-9a-fA-F]+))?)");
+    // [Upgraded Regex] 支持表达式 (Key = Expr)
+    boost::regex re_member(R"(([a-zA-Z0-9_]+)\s*(?:=\s*([^,]+))?)");
 
     boost::smatch m;
     int currentVal = 0;
@@ -436,10 +496,25 @@ public:
     while (boost::regex_search(start, body.cend(), m, re_member))
     {
       std::string key = m[1];
-      std::string val_str = m[2];
+      std::string val_str = "";
 
-      // 过滤掉可能是数字开头的误判 (虽然 regex [a-z] 限制了，但防万一)
+      if (m.size() > 2 && m[2].matched)
+      {
+        val_str = m[2];
+        // 清理尾随注释
+        size_t cpos = val_str.find("//");
+        if (cpos != std::string::npos) val_str = val_str.substr(0, cpos);
+        cpos = val_str.find("/*");
+        if (cpos != std::string::npos) val_str = val_str.substr(0, cpos);
+        boost::trim(val_str);
+      }
+
       if (isdigit(key[0]))
+      {
+        start = m.suffix().first;
+        continue;
+      }
+      if (key == "public" || key == "private" || key == "protected")
       {
         start = m.suffix().first;
         continue;
@@ -447,62 +522,32 @@ public:
 
       int val = currentVal;
 
-      // 如果有显式赋值
-      if (m[2].matched && !val_str.empty())
+      if (!val_str.empty())
       {
-        // 1. 十六进制 (0x...)
-        if (val_str.find("0x") == 0 || val_str.find("0X") == 0)
-        {
-          try { val = std::stoul(val_str, nullptr, 16); }
-          catch (...)
-          {
-          }
-        }
-        // 2. 十进制数字 (123, -123)
-        else if (isdigit(val_str[0]) || val_str[0] == '-')
-        {
-          try { val = std::stoi(val_str); }
-          catch (...)
-          {
-          }
-        }
-        // 3. 别名 (ANOTHER_KEY)
-        else
-        {
-          if (symbol_table.count(val_str))
-          {
-            val = symbol_table[val_str];
-          }
-          else
-          {
-            // 如果引用了未定义的宏或者向前引用，这里没法完美解析
-            // 为了不报错，我们保持 currentVal 不变，或者打印警告
-            // std::cerr << "[Gen Warning] Enum alias '" << val_str << "' not found." << std::endl;
-          }
-        }
-        // 更新基准值
+        // [Fixed] 使用求值器
+        val = evaluate_expression(val_str, symbol_table);
         currentVal = val;
       }
 
-      // 记录到符号表
       symbol_table[key] = val;
       edef.members.push_back({key, val});
 
-      // 下一个值默认 +1
       currentVal++;
-
       start = m.suffix().first;
     }
-    enums.push_back(edef);
+
+    if (!edef.members.empty())
+    {
+      enums.push_back(edef);
+    }
   }
 
   void generate()
   {
     fs::path outCppPath = fs::path(outputDir) / (moduleName + "_bind.cpp");
     fs::path outHPath = fs::path(outputDir) / (moduleName + "_bind.h");
-    fs::path outTSPath = fs::path(outputDir) / (moduleName + ".d.ts"); // [New] TS path
+    fs::path outTSPath = fs::path(outputDir) / (moduleName + ".d.ts");
 
-    // 1. Generate C++ Binding Code
     std::ofstream out(outCppPath.string());
     out << "// Generated by Project Gemini\n";
     out << "#include \"quickjs.h\"\n";
@@ -532,6 +577,9 @@ public:
 
     for (const auto& m : macros)
     {
+      // [Fixed] Add guards for macros
+      for (const auto& g : m.guards) out << g << "\n";
+
       if (m.value.find('"') != std::string::npos)
       {
         out << "    JS_PROP_STRING_DEF(\"" << m.name << "\", " << m.value << ", JS_PROP_CONFIGURABLE),\n";
@@ -540,6 +588,8 @@ public:
       {
         out << "    JS_PROP_DOUBLE_DEF(\"" << m.name << "\", " << m.value << ", JS_PROP_CONFIGURABLE),\n";
       }
+
+      for (size_t i = 0; i < m.guards.size(); ++i) out << "#endif\n";
     }
     out << "};\n\n";
 
@@ -579,38 +629,34 @@ public:
     out << "}\n";
     out.close();
 
-    // 2. Generate C Header
     std::ofstream outH(outHPath.string());
-    outH <<
-      "// Generated by Project Gemini\n#pragma once\n#include \"quickjs.h\"\n\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n";
+    outH << "// Generated\n#pragma once\n#include \"quickjs.h\"\n\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n";
     outH << "JSModuleDef* js_init_module_" << moduleName << "(JSContext* ctx, const char* module_name);\n\n";
     outH << "#ifdef __cplusplus\n}\n#endif\n";
     outH.close();
 
-    // 3. Generate TypeScript Definitions (.d.ts) [New Section]
     std::ofstream outTS(outTSPath.string());
-    outTS << "// Type definitions for " << moduleName << "\n";
-    outTS << "// Generated by Project Gemini\n\n";
+    outTS << "// Type definitions for " << moduleName << "\n\n";
 
-    // Macros
     if (!macros.empty())
     {
       outTS << "// Constants\n";
+      std::set<std::string> exported_macros; // [Fixed] De-duplicate
       for (const auto& m : macros)
       {
+        if (exported_macros.count(m.name)) continue;
         std::string tsType = (m.value.find('"') != std::string::npos) ? "string" : "number";
         outTS << "export const " << m.name << ": " << tsType << ";\n";
+        exported_macros.insert(m.name);
       }
       outTS << "\n";
     }
 
-    // Enums
     if (!enums.empty())
     {
       outTS << "// Enums\n";
       for (const auto& e : enums)
       {
-        // Ignore C++ guards in d.ts to provide full API surface
         outTS << "export enum " << e.name << " {\n";
         for (size_t i = 0; i < e.members.size(); ++i)
         {
@@ -622,13 +668,11 @@ public:
       }
     }
 
-    // Functions
     if (!functions.empty())
     {
       outTS << "// Functions\n";
       for (const auto& f : functions)
       {
-        // Ignore C++ guards in d.ts
         std::string tsRet = cpp_to_ts_type(f.retType);
         std::string tsArgs = format_ts_args(f.args);
         outTS << "export function " << f.name << "(" << tsArgs << "): " << tsRet << ";\n";
