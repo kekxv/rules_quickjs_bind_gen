@@ -1,3 +1,5 @@
+load("@aspect_rules_js//js:defs.bzl", "js_library")
+
 def _qjs_binding_impl(ctx):
     # 1. 声明输出文件：必须包含 .d.ts
     out_cpp = ctx.actions.declare_file(ctx.attr.module_name + "_bind.cpp")
@@ -53,12 +55,12 @@ def qjs_cc_library(name, header, module_name, includes = [], include_list = [], 
         include_list = include_list,
     )
 
-    # [新增] 创建一个 filegroup 专门用来方便你找到 .d.ts 文件
-    # output_group 是为了以后如果分离更彻底，目前直接用 gen_name 也可以
-    native.filegroup(
+    # 用 js_library 包装生成的 .d.ts
+    js_library(
         name = ts_target_name,
+        # 这里非常关键：我们只需要 .d.ts 文件
         srcs = [":" + gen_name],
-        output_group = "files",  # 默认输出
+        visibility = ["//visibility:public"],
     )
 
     native.cc_library(
