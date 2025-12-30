@@ -17,6 +17,13 @@
 #define QJS_LOG(msg)
 #endif
 
+// 用于在 C++ 参数中接收 JS 回调函数
+struct QJSCallback
+{
+  JSContext* ctx;
+  JSValueConst value; // 注意：这是弱引用，如果需要持久保存，必须在 C++ 侧调用 JS_DupValue
+};
+
 template <typename T>
 T js_to_cpp(JSContext* ctx, JSValueConst val)
 {
@@ -92,6 +99,16 @@ T js_to_cpp(JSContext* ctx, JSValueConst val)
     }
 
     return reinterpret_cast<T>(static_cast<uintptr_t>(ptr_val));
+  }
+  else if constexpr (std::is_same_v<T, QJSCallback>)
+  {
+    if (!JS_IsFunction(ctx, val))
+    {
+      // 如果传的不是函数，可以在这里报错或者返回空
+      // 为了 Wrapper 安全，这里返回空，具体逻辑由函数内部校验
+      return {ctx, JS_UNDEFINED};
+    }
+    return {ctx, val};
   }
   return T{};
 }

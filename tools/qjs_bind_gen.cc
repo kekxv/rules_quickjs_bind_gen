@@ -35,7 +35,7 @@ struct EnumDef
 struct MacroDef
 {
   std::string name, value;
-  std::vector<std::string> guards; // [New] Added guards for macros
+  std::vector<std::string> guards;
 };
 
 class BindingGenerator
@@ -55,13 +55,10 @@ public:
   {
   }
 
-  // 简单的表达式求值器 (支持 | 和 << 以及括号)
   int evaluate_expression(std::string expr, const std::map<std::string, int>& symbolTable)
   {
-    // 预处理：去掉空格
     expr.erase(std::remove(expr.begin(), expr.end(), ' '), expr.end());
 
-    // 处理 |
     if (expr.find('|') != std::string::npos)
     {
       std::vector<std::string> parts;
@@ -74,13 +71,11 @@ public:
       return result;
     }
 
-    // 处理 ()
     if (expr.length() > 2 && expr.front() == '(' && expr.back() == ')')
     {
       return evaluate_expression(expr.substr(1, expr.length() - 2), symbolTable);
     }
 
-    // 处理 <<
     size_t shiftPos = expr.find("<<");
     if (shiftPos != std::string::npos)
     {
@@ -89,7 +84,6 @@ public:
       return evaluate_expression(left, symbolTable) << evaluate_expression(right, symbolTable);
     }
 
-    // 处理 +
     size_t plusPos = expr.find("+");
     if (plusPos != std::string::npos)
     {
@@ -98,7 +92,6 @@ public:
       return evaluate_expression(left, symbolTable) + evaluate_expression(right, symbolTable);
     }
 
-    // 基础值
     if (expr.find("0x") == 0 || expr.find("0X") == 0)
     {
       try { return std::stoul(expr, nullptr, 16); }
@@ -110,7 +103,6 @@ public:
       catch (...) { return 0; }
     }
 
-    // 查表
     if (symbolTable.count(expr))
     {
       return symbolTable.at(expr);
@@ -216,7 +208,6 @@ public:
       std::string type, name;
       bool isArray = false;
 
-      // [Fixed] 正则提取：类型 vs 变量名
       boost::regex re_extract(R"((.*?)(?:\s+|[*&]+)([\w]+)(\[\])?$)");
       boost::smatch m;
 
@@ -313,7 +304,7 @@ public:
     boost::regex re_enum_c(R"(typedef\s+enum\s*\{([^}]*)\}\s*(\w+);)");
 
     boost::regex re_func(R"(([a-zA-Z0-9_:<>\*&\s]+?)\s+(\w+)\s*\(([\s\S]*?)\)\s*(?:;|{))");
-    boost::regex re_enum_member(R"((\w+)(\s*=\s*([a-zA-Z0-9_]+|-?\d+|0x[0-9a-fA-F]+))?)"); // 这只是初始正则，process_enum 里有更强的
+    boost::regex re_enum_member(R"((\w+)(\s*=\s*([a-zA-Z0-9_]+|-?\d+|0x[0-9a-fA-F]+))?)");
 
     std::set<std::string> blacklist = {
       "if", "while", "for", "switch", "return", "sizeof", "catch", "else",
@@ -363,7 +354,6 @@ public:
           }
           if (boost::regex_search(trimmed, m, re_macro_val))
           {
-            // [Fixed] Save active guards
             macros.push_back({m[1], m[2], get_active_guards(guardStack)});
           }
         }
@@ -443,6 +433,16 @@ public:
           std::string name = m[2];
           std::string rawArgs = m[3];
 
+          // 过滤掉包含 = / new / return 的语句，防止把函数体内的语句当成函数声明
+          if (rawRet.find('=') != std::string::npos ||
+            rawRet.find("new") != std::string::npos ||
+            rawRet.find("return") != std::string::npos ||
+            rawRet.find("delete") != std::string::npos)
+          {
+            buffer.clear();
+            continue;
+          }
+
           if (rawArgs.find("...") != std::string::npos)
           {
             buffer.clear();
@@ -486,7 +486,6 @@ public:
 
     std::map<std::string, int> symbol_table;
 
-    // [Upgraded Regex] 支持表达式 (Key = Expr)
     boost::regex re_member(R"(([a-zA-Z0-9_]+)\s*(?:=\s*([^,]+))?)");
 
     boost::smatch m;
@@ -501,7 +500,6 @@ public:
       if (m.size() > 2 && m[2].matched)
       {
         val_str = m[2];
-        // 清理尾随注释
         size_t cpos = val_str.find("//");
         if (cpos != std::string::npos) val_str = val_str.substr(0, cpos);
         cpos = val_str.find("/*");
@@ -524,7 +522,6 @@ public:
 
       if (!val_str.empty())
       {
-        // [Fixed] 使用求值器
         val = evaluate_expression(val_str, symbol_table);
         currentVal = val;
       }
@@ -577,9 +574,7 @@ public:
 
     for (const auto& m : macros)
     {
-      // [Fixed] Add guards for macros
       for (const auto& g : m.guards) out << g << "\n";
-
       if (m.value.find('"') != std::string::npos)
       {
         out << "    JS_PROP_STRING_DEF(\"" << m.name << "\", " << m.value << ", JS_PROP_CONFIGURABLE),\n";
@@ -588,7 +583,6 @@ public:
       {
         out << "    JS_PROP_DOUBLE_DEF(\"" << m.name << "\", " << m.value << ", JS_PROP_CONFIGURABLE),\n";
       }
-
       for (size_t i = 0; i < m.guards.size(); ++i) out << "#endif\n";
     }
     out << "};\n\n";
@@ -641,7 +635,7 @@ public:
     if (!macros.empty())
     {
       outTS << "// Constants\n";
-      std::set<std::string> exported_macros; // [Fixed] De-duplicate
+      std::set<std::string> exported_macros;
       for (const auto& m : macros)
       {
         if (exported_macros.count(m.name)) continue;
