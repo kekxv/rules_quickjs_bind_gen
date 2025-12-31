@@ -1,36 +1,52 @@
 #pragma once
 
 #include <string>
+#include <iostream>
 
-// --- 1. 宏定义 (保持不变) ---
 #define API_VERSION "3.1.4"
 #define MAX_USERS 100
 
-// --- 2. 枚举 (保持不变) ---
-enum class SystemState
-{
+enum class SystemState {
   BOOTING = 0,
   READY,
   SHUTDOWN
 };
 
-// --- 3. 普通函数 (干净的声明) ---
+// 简单的结构体
+struct Config {
+  int port;
+  std::string host;
+  bool debug_mode;
+};
+
+// 复杂结构体 (包含方法演示)
+struct User {
+  int id;
+  std::string name;
+  int score;
+};
+
+// --- 普通函数 ---
 std::string get_server_name();
 
-// --- 4. 关键测试：多行声明 ---
-// 生成器现在可以处理这种“丑陋”但合法的 C++ 格式
-// 返回类型在第一行，函数名在第二行，参数列表跨越多行
-int
-multiply(int a,
-         int b);
+int multiply(int a, int b);
 
-// --- 5. 关键测试：Inline 函数 (带函数体) ---
-// 生成器会识别到 '{' 并停止，自动忽略 inline 关键字
-inline int add(int a, int b)
-{
+inline int add(int a, int b) {
   return a + b;
 }
 
-// --- 6. 关键测试：带注释 ---
-// 生成器会先剔除注释，所以这行是安全的
-void log_message(const std::string& msg); // 这是一个尾随注释
+void log_message(const std::string& msg);
+
+// --- [新增] 结构体交互演示 ---
+
+// 1. 接收结构体 (按值传递，JS对象会被复制为C++对象)
+void print_config(Config cfg);
+
+// 2. 返回结构体 (返回给 JS 一个新对象)
+Config create_default_config();
+
+// 3. 修改传入的结构体 (按指针传递，JS对象的内部C++指针被修改)
+void update_user_score(User* user, int new_score);
+
+// 4. 工厂函数
+User* create_user(const std::string& name, int id);

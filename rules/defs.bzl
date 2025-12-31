@@ -70,6 +70,7 @@ def qjs_cc_library(name, header, module_name, includes = [], include_list = [], 
         includes = includes,
         deps = deps + [
             "@quickjs-ng",
+            "@boost.json",
             "@rules_quickjs_bind_gen//tools:qjs_utils",
         ],
         alwayslink = True,
